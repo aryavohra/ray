@@ -127,6 +127,15 @@ def _create_compute(gcp_credentials=None):
     return discovery.build(
         "compute", "v1", credentials=gcp_credentials, cache_discovery=False)
 
+def _create_tpu(gcp_credentials=None):
+    return discovery.build(
+        "tpu",
+        "v2alpha1",
+        discoveryServiceUrl="https://tpu.googleapis.com/$discovery/rest?version=v2alpha1",
+        credentials=gcp_credentials,
+        cache_discovery=False
+    )
+
 
 def construct_clients_from_provider_config(provider_config):
     """
@@ -142,7 +151,8 @@ def construct_clients_from_provider_config(provider_config):
         # credentials in the local environment.
         return _create_crm(), \
             _create_iam(), \
-            _create_compute()
+            _create_compute(), \
+            _create_tpu()
 
     assert ("type" in gcp_credentials), \
         "gcp_credentials cluster yaml field missing 'type' field."
@@ -169,7 +179,8 @@ def construct_clients_from_provider_config(provider_config):
 
     return _create_crm(credentials), \
         _create_iam(credentials), \
-        _create_compute(credentials)
+        _create_compute(credentials), \
+        _create_tpu(credentials)
 
 
 def bootstrap_gcp(config):
@@ -178,7 +189,7 @@ def bootstrap_gcp(config):
     # Used internally to store head IAM role.
     config["head_node"] = {}
 
-    crm, iam, compute = \
+    crm, iam, compute, tpu = \
         construct_clients_from_provider_config(config["provider"])
 
     config = _configure_project(config, crm)

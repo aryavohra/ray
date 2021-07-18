@@ -38,6 +38,28 @@ def wait_for_compute_zone_operation(compute, project_name, operation, zone):
 
     return result
 
+def wait_for_tpu_zone_operation(tpu, project_name, operation, zone):
+    """Poll for tpu zone operation until finished."""
+    logger.info("wait_for_tpu_zone_operation: "
+                "Waiting for operation {} to finish...".format(
+                    operation["name"]))
+
+    for _ in range(MAX_POLLS):
+        result = tpu.zoneOperations().get(
+            project=project_name, operation=operation["name"],
+            zone=zone).execute()
+        if "error" in result:
+            raise Exception(result["error"])
+
+        if result["status"] == "DONE":
+            logger.info("wait_for_tpu_zone_operation: "
+                        "Operation {} finished.".format(operation["name"]))
+            break
+
+        time.sleep(POLL_INTERVAL)
+
+    return result
+
 
 def _retry(method, max_tries=5, backoff_s=1):
     """Retry decorator for methods of GCPNodeProvider.
@@ -79,7 +101,7 @@ class GCPNodeProvider(NodeProvider):
         self.cached_nodes = {}
 
     def _construct_clients(self):
-        _, _, self.compute = construct_clients_from_provider_config(
+        _, _, self.compute, self.tpu = construct_clients_from_provider_config(
             self.provider_config)
 
     @_retry
@@ -206,33 +228,51 @@ class GCPNodeProvider(NodeProvider):
                     (INSTANCE_NAME_MAX_LEN - INSTANCE_NAME_UUID_LEN - 1)), (
                         name_label, len(name_label))
 
-            machine_type = ("zones/{zone}/machineTypes/{machine_type}"
-                            "".format(
-                                zone=availability_zone,
-                                machine_type=base_config["machineType"]))
-            labels = dict(config.get("labels", {}), **labels)
+            if "tpu" in config.keys():
+                body = dict(config['tpu'][0])
+                body["labels"] = {TAG_RAY_CLUSTER_NAME: self.cluster_name}
 
-            config.update({
-                "machineType": machine_type,
-                "labels": dict(labels,
-                               **{TAG_RAY_CLUSTER_NAME: self.cluster_name}),
-            })
+                operations = [
+                    self.tpu.projects().locations().nodes().create(
+                            parent="projects/{project_id}/locations/{availability_zone}".format(
+                                project_id=project_id,
+                                availability_zone=availability_zone),
+                            nodeId=name_label,
+                            body=body)
+                        ).execute() for i in range(count)
+                ]
+                
+                for operation in operations:
+                    wait_for_tpu_zone_operation(self.tpu, project_id,
+                                                    operation, availability_zone)
+            else:
+                machine_type = ("zones/{zone}/machineTypes/{machine_type}"
+                                "".format(
+                                    zone=availability_zone,
+                                    machine_type=base_config["machineType"]))
+                labels = dict(config.get("labels", {}), **labels)
 
-            operations = [
-                self.compute.instances().insert(
-                    project=project_id,
-                    zone=availability_zone,
-                    body=dict(
-                        config, **{
-                            "name": ("{name_label}-{uuid}".format(
-                                name_label=name_label,
-                                uuid=uuid4().hex[:INSTANCE_NAME_UUID_LEN]))
-                        })).execute() for i in range(count)
-            ]
+                config.update({
+                    "machineType": machine_type,
+                    "labels": dict(labels,
+                                   **{TAG_RAY_CLUSTER_NAME: self.cluster_name}),
+                })
 
-            for operation in operations:
-                wait_for_compute_zone_operation(self.compute, project_id,
-                                                operation, availability_zone)
+                operations = [
+                    self.compute.instances().insert(
+                        project=project_id,
+                        zone=availability_zone,
+                        body=dict(
+                            config, **{
+                                "name": ("{name_label}-{uuid}".format(
+                                    name_label=name_label,
+                                    uuid=uuid4().hex[:INSTANCE_NAME_UUID_LEN]))
+                            })).execute() for i in range(count)
+                ]
+
+                for operation in operations:
+                    wait_for_compute_zone_operation(self.compute, project_id,
+                                                    operation, availability_zone)
 
     @_retry
     def terminate_node(self, node_id):
