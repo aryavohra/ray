@@ -38,6 +38,7 @@ def wait_for_compute_zone_operation(compute, project_name, operation, zone):
 
     return result
 
+
 def wait_for_tpu_zone_operation(tpu, project_name, operation, zone):
     """Poll for tpu zone operation until finished."""
     logger.info("wait_for_tpu_zone_operation: "
@@ -45,13 +46,13 @@ def wait_for_tpu_zone_operation(tpu, project_name, operation, zone):
                     operation["name"]))
 
     for _ in range(MAX_POLLS):
-        result = tpu.zoneOperations().get(
-            project=project_name, operation=operation["name"],
-            zone=zone).execute()
+        result = tpu.projects().locations().operations().get(
+            name=operation["name"]).execute()
+
         if "error" in result:
             raise Exception(result["error"])
 
-        if result["status"] == "DONE":
+        if result["done"] == "true":
             logger.info("wait_for_tpu_zone_operation: "
                         "Operation {} finished.".format(operation["name"]))
             break
@@ -135,27 +136,45 @@ class GCPNodeProvider(NodeProvider):
 
             filter_expr = " AND ".join(not_empty_filters)
 
-            response = self.compute.instances().list(
+            compute_instances = self.compute.instances().list(
                 project=self.provider_config["project_id"],
                 zone=self.provider_config["availability_zone"],
                 filter=filter_expr,
             ).execute()
 
-            instances = response.get("items", [])
+            instances = compute_instances.get("items", [])
+
+            tpu_vms = self.tpu.projects().locations().nodes().list(
+                parent="projects/{project_id}/locations/{availability_zone}".format(
+                    project_id=self.provider_config["project_id"],
+                    availability_zone=self.provider_config["availability_zone"]),
+            ).execute()
+
+            instances += tpu_vms.get("nodes", [])
+
             # Note: All the operations use "name" as the unique instance id
             self.cached_nodes = {i["name"]: i for i in instances}
 
             return [i["name"] for i in instances]
 
+    def is_tpu_vm(self, node_id):
+        return "tpuVM" in node_id
+
     def is_running(self, node_id):
         with self.lock:
             node = self._get_cached_node(node_id)
-            return node["status"] == "RUNNING"
+            if node.get("state") != None:
+                return node["state"] == "READY"
+            else:
+                return node["status"] == "RUNNING"
 
     def is_terminated(self, node_id):
         with self.lock:
             node = self._get_cached_node(node_id)
-            return node["status"] not in {"PROVISIONING", "STAGING", "RUNNING"}
+            if node.get("state") != None:
+                return node["state"] not in {"STARTING", "READY", "RESTARTING", "CREATING", "REIMAGING"}
+            else:
+                return node["status"] not in {"PROVISIONING", "STAGING", "RUNNING"}
 
     def node_tags(self, node_id):
         with self.lock:
@@ -171,17 +190,33 @@ class GCPNodeProvider(NodeProvider):
             availability_zone = self.provider_config["availability_zone"]
 
             node = self._get_node(node_id)
-            operation = self.compute.instances().setLabels(
-                project=project_id,
-                zone=availability_zone,
-                instance=node_id,
-                body={
-                    "labels": dict(node["labels"], **labels),
-                    "labelFingerprint": node["labelFingerprint"]
-                }).execute()
 
-            result = wait_for_compute_zone_operation(
-                self.compute, project_id, operation, availability_zone)
+            if self.is_tpu_vm(node_id):
+                while not self.is_running(node_id):
+                    time.sleep(1)
+                    print("waiting")
+                operation = self.tpu.projects().locations().nodes().patch(
+                    name=node_id,
+                    updateMask="labels",
+                    body={
+                        "labels": dict(node["labels"], **labels),
+                    }
+                ).execute()
+
+                result = wait_for_tpu_zone_operation(
+                    self.tpu, project_id, operation, availability_zone)
+            else:
+                operation = self.compute.instances().setLabels(
+                    project=project_id,
+                    zone=availability_zone,
+                    instance=node_id,
+                    body={
+                        "labels": dict(node["labels"], **labels),
+                        "labelFingerprint": node["labelFingerprint"]
+                    }).execute()
+
+                result = wait_for_compute_zone_operation(
+                    self.compute, project_id, operation, availability_zone)
 
             return result
 
@@ -190,8 +225,11 @@ class GCPNodeProvider(NodeProvider):
             node = self._get_cached_node(node_id)
 
             def get_external_ip(node):
-                return node.get("networkInterfaces", [{}])[0].get(
-                    "accessConfigs", [{}])[0].get("natIP", None)
+                if self.is_tpu_vm(node_id):
+                    return node.get("networkEndpoints", [{}])[0].get("accessConfig").get("externalIp")
+                else:
+                    return node.get("networkInterfaces", [{}])[0].get(
+                        "accessConfigs", [{}])[0].get("natIP", None)
 
             ip = get_external_ip(node)
             if ip is None:
@@ -205,7 +243,10 @@ class GCPNodeProvider(NodeProvider):
             node = self._get_cached_node(node_id)
 
             def get_internal_ip(node):
-                return node.get("networkInterfaces", [{}])[0].get("networkIP")
+                if self.is_tpu_vm(node_id):
+                    return node.get("networkEndpoints", [{}])[0].get("ipAddress")
+                else:
+                    return node.get("networkInterfaces", [{}])[0].get("networkIP")
 
             ip = get_internal_ip(node)
             if ip is None:
@@ -228,18 +269,18 @@ class GCPNodeProvider(NodeProvider):
                     (INSTANCE_NAME_MAX_LEN - INSTANCE_NAME_UUID_LEN - 1)), (
                         name_label, len(name_label))
 
-            if "tpu" in config.keys():
-                body = dict(config['tpu'][0])
-                body["labels"] = {TAG_RAY_CLUSTER_NAME: self.cluster_name}
+            if "tpuVM" in config.keys():
+                body = dict(config['tpuVM'][0])
+                body["labels"] = dict(labels,
+                    **{TAG_RAY_CLUSTER_NAME: self.cluster_name})
 
                 operations = [
                     self.tpu.projects().locations().nodes().create(
                             parent="projects/{project_id}/locations/{availability_zone}".format(
                                 project_id=project_id,
                                 availability_zone=availability_zone),
-                            nodeId=name_label,
-                            body=body)
-                        ).execute() for i in range(count)
+                            nodeId=name_label+"-tpuVM",
+                            body=body).execute() for i in range(count)
                 ]
                 
                 for operation in operations:
@@ -280,14 +321,25 @@ class GCPNodeProvider(NodeProvider):
             project_id = self.provider_config["project_id"]
             availability_zone = self.provider_config["availability_zone"]
 
-            operation = self.compute.instances().delete(
-                project=project_id,
-                zone=availability_zone,
-                instance=node_id,
-            ).execute()
+            if self.is_tpu_vm(node_id):
+                operation = self.tpu.projects().locations().nodes().delete(
+                    # parent="projects/{project_id}/locations/{availability_zone}".format(
+                                # project_id=project_id,
+                                # availability_zone=availability_zone),
+                    name=node_id
+                ).execute()
 
-            result = wait_for_compute_zone_operation(
-                self.compute, project_id, operation, availability_zone)
+                result = wait_for_tpu_zone_operation(
+                    self.compute, project_id, operation, availability_zone)
+            else:
+                operation = self.compute.instances().delete(
+                    project=project_id,
+                    zone=availability_zone,
+                    instance=node_id,
+                ).execute()
+
+                result = wait_for_compute_zone_operation(
+                    self.compute, project_id, operation, availability_zone)
 
             return result
 
@@ -299,11 +351,18 @@ class GCPNodeProvider(NodeProvider):
             if node_id in self.cached_nodes:
                 return self.cached_nodes[node_id]
 
-            instance = self.compute.instances().get(
-                project=self.provider_config["project_id"],
-                zone=self.provider_config["availability_zone"],
-                instance=node_id,
-            ).execute()
+            if self.is_tpu_vm(node_id):
+                instance = self.tpu.instances().get(
+                    project=self.provider_config["project_id"],
+                    zone=self.provider_config["availability_zone"],
+                    name=node_id,
+                ).execute()
+            else:
+                instance = self.compute.instances().get(
+                    project=self.provider_config["project_id"],
+                    zone=self.provider_config["availability_zone"],
+                    instance=node_id,
+                ).execute()
 
             return instance
 
