@@ -42,8 +42,8 @@ def wait_for_compute_zone_operation(compute, project_name, operation, zone):
 def wait_for_tpu_zone_operation(tpu, project_name, operation, zone):
     """Poll for tpu zone operation until finished."""
     logger.info("wait_for_tpu_zone_operation: "
-                "Waiting for operation {} to finish...".format(
-                    operation["name"]))
+                "Waiting for operation ({}) {} to finish...".format(
+                    operation["metadata"]["verb"], operation["name"]))
 
     for _ in range(MAX_POLLS):
         result = tpu.projects().locations().operations().get(
@@ -54,7 +54,8 @@ def wait_for_tpu_zone_operation(tpu, project_name, operation, zone):
 
         if result["done"] == "true":
             logger.info("wait_for_tpu_zone_operation: "
-                        "Operation {} finished.".format(operation["name"]))
+                        "Operation ({}) {} finished.".format(
+                            operation["metadata"]["verb"], operation["name"]))
             break
 
         time.sleep(POLL_INTERVAL)
@@ -192,9 +193,6 @@ class GCPNodeProvider(NodeProvider):
             node = self._get_node(node_id)
 
             if self.is_tpu_vm(node_id):
-                while not self.is_running(node_id):
-                    time.sleep(1)
-                    print("waiting")
                 operation = self.tpu.projects().locations().nodes().patch(
                     name=node_id,
                     updateMask="labels",
@@ -282,7 +280,7 @@ class GCPNodeProvider(NodeProvider):
                             nodeId=name_label+"-tpuVM",
                             body=body).execute() for i in range(count)
                 ]
-                
+
                 for operation in operations:
                     wait_for_tpu_zone_operation(self.tpu, project_id,
                                                     operation, availability_zone)
@@ -352,9 +350,9 @@ class GCPNodeProvider(NodeProvider):
                 return self.cached_nodes[node_id]
 
             if self.is_tpu_vm(node_id):
-                instance = self.tpu.instances().get(
-                    project=self.provider_config["project_id"],
-                    zone=self.provider_config["availability_zone"],
+                instance = self.tpu.projects().locations().nodes().get(
+                    # project=self.provider_config["project_id"],
+                    # zone=self.provider_config["availability_zone"],
                     name=node_id,
                 ).execute()
             else:
